@@ -1,0 +1,2787 @@
+### USER
+// Abstractions.cs
+
+namespace BusLibrary02.Core;
+
+public abstract record MessageBase(string Key, string? SenderKey = null) : IMessage
+{
+    public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
+}
+
+// Attributes.cs
+
+using Microsoft.Extensions.DependencyInjection;
+
+namespace BusLibrary02.Core;
+
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = true, Inherited = false)]
+public sealed class HandlesAttribute : Attribute
+{
+    public string Key { get; }
+    public HandlesAttribute(string key) => Key = key;
+}
+----
+public sealed class AttributeKeyRouter : IKeyRouter
+{
+    private readonly IEventHandlerRegistry _registry;
+    public AttributeKeyRouter(IEventHandlerRegistry registry) => _registry = registry;
+    public IEnumerable<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>> Resolve(IServiceProvider serviceProvider, string key)
+    {
+        var handlerMap = _registry.GetHandlerMap();
+        if (!handlerMap.TryGetValue(key, out var handlerTypes))
+            return Enumerable.Empty<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>();
+        var invokers = new List<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>();
+        foreach (var handlerType in handlerTypes)
+        {
+            invokers.Add((sp, msg, ct) =>
+            {
+                var handler = sp.GetRequiredService(handlerType);
+                var handleMethod = handlerType.GetMethod("Handle");
+                if (handleMethod == null)
+                    throw new InvalidOperationException($"Handler {handlerType.Name} does not have Handle method");
+                return (ValueTask)handleMethod.Invoke(handler, new object[] { msg, ct });
+            });
+        }
+        return invokers;
+    }
+}
+_______
+
+// CompositeKeyRouter.cs (исправленная версия)
+
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.DependencyInjection;
+using System.Linq;
+
+namespace BusLibrary02.Core;
+
+/// <summary>
+/// Композитный роутер, объединяющий атрибутные и динамические подписки
+/// </summary>
+public sealed class CompositeKeyRouter : IKeyRouter
+{
+    private readonly IEventHandlerRegistry _registry;
+    private readonly DynamicSubscriptionManager _subscriptionManager;
+    private readonly ILogger<CompositeKeyRouter>? _logger;
+
+    public CompositeKeyRouter(
+        IEventHandlerRegistry registry,
+        DynamicSubscriptionManager subscriptionManager,
+        ILogger<CompositeKeyRouter>? logger = null)
+    {
+        _registry = registry;
+        _subscriptionManager = subscriptionManager;
+        _logger = logger;
+    }
+
+    public IEnumerable<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>
+        Resolve(IServiceProvider serviceProvider, string key)
+    {
+        var handlers = new List<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>();
+
+        // 1. Статические обработчики из атрибутов
+        var staticHandlers = GetStaticHandlers(serviceProvider, key);
+        handlers.AddRange(staticHandlers);
+
+        _logger?.LogDebug("Found {Count} static handlers for key '{Key}'",
+            staticHandlers.Count(), key);
+
+        // 2. Динамические обработчики
+        var dynamicHandlers = _subscriptionManager.GetHandlers(key);
+        handlers.AddRange(dynamicHandlers);
+
+        _logger?.LogDebug("Found {Count} dynamic handlers for key '{Key}'",
+            dynamicHandlers.Count(), key);
+
+        return handlers;
+    }
+
+    private IEnumerable<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>
+        GetStaticHandlers(IServiceProvider serviceProvider, string key)
+    {
+        var handlerMap = _registry.GetHandlerMap();
+        if (!handlerMap.TryGetValue(key, out var handlerTypes))
+            return Enumerable.Empty<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>();
+
+        var invokers = new List<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>();
+        foreach (var handlerType in handlerTypes)
+        {
+            invokers.Add((sp, msg, ct) =>
+            {
+                var handler = sp.GetRequiredService(handlerType);
+                var handleMethod = handlerType.GetMethod("Handle");
+                if (handleMethod == null)
+                    throw new InvalidOperationException($"Handler {handlerType.Name} does not have Handle method");
+
+                return (ValueTask)handleMethod.Invoke(handler, new object[] { msg, ct });
+            });
+        }
+        return invokers;
+    }
+}
+----
+// DynamicSubscriptions.cs (исправленная версия)
+
+using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
+using System.Linq;
+using System.Reflection;
+
+namespace BusLibrary02.Core;
+
+/// <summary>
+/// Интерфейс для динамической подписки на события
+/// </summary>
+public interface IDynamicSubscriptionManager
+{
+    /// <summary>
+    /// Подписаться на событие по ключу
+    /// </summary>
+    IDisposable Subscribe<TMessage>(string key, Func<TMessage, CancellationToken, ValueTask> handler)
+        where TMessage : IMessage;
+
+    /// <summary>
+    /// Подписаться на событие по типу сообщения (используя атрибут)
+    /// </summary>
+    IDisposable Subscribe<TMessage>(Func<TMessage, CancellationToken, ValueTask> handler)
+        where TMessage : IMessage;
+
+    /// <summary>
+    /// Отписаться от события по ключу
+    /// </summary>
+    void Unsubscribe(string key);
+
+    /// <summary>
+    /// Отписаться от события по типу сообщения
+    /// </summary>
+    void Unsubscribe<TMessage>() where TMessage : IMessage;
+
+    IEnumerable<string> GetSubscribedKeys();
+}
+
+/// <summary>
+/// Менеджер динамических подписок
+/// </summary>
+public sealed class DynamicSubscriptionManager : IDynamicSubscriptionManager, IDisposable
+{
+    private readonly ConcurrentDictionary<string, List<SubscriptionEntry>> _subscriptions = new();
+    private readonly ConcurrentDictionary<Type, string> _typeToKeyMap = new();
+    private readonly ConcurrentDictionary<Type, string> _typeToStaticKeyMap = new();
+    private readonly ILogger<DynamicSubscriptionManager>? _logger;
+    private bool _disposed;
+
+    private class SubscriptionEntry
+    {
+        public Type MessageType { get; }
+        public Delegate HandlerDelegate { get; }
+        public Guid Id { get; }
+
+        public SubscriptionEntry(Type messageType, Delegate handlerDelegate, Guid id)
+        {
+            MessageType = messageType;
+            HandlerDelegate = handlerDelegate;
+            Id = id;
+        }
+    }
+
+    public DynamicSubscriptionManager(ILogger<DynamicSubscriptionManager>? logger = null)
+    {
+        _logger = logger;
+
+        // Инициализируем статические ключи для стандартных типов сообщений
+        InitializeStaticKeys();
+    }
+
+    private void InitializeStaticKeys()
+    {
+        // Пример добавления статических ключей для известных типов
+        // Можно добавить здесь или использовать конфигурацию
+    }
+
+    /// <summary>
+    /// Подписаться на событие по ключу
+    /// </summary>
+    public IDisposable Subscribe<TMessage>(string key, Func<TMessage, CancellationToken, ValueTask> handler)
+        where TMessage : IMessage
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            throw new ArgumentException("Key cannot be null or empty", nameof(key));
+        if (handler is null)
+            throw new ArgumentNullException(nameof(handler));
+
+        var entry = new SubscriptionEntry(
+            typeof(TMessage),
+            handler,
+            Guid.NewGuid()
+        );
+
+        var subscriptions = _subscriptions.GetOrAdd(key, _ => new List<SubscriptionEntry>());
+
+        lock (subscriptions)
+        {
+            subscriptions.Add(entry);
+        }
+
+        _logger?.LogDebug("Subscribed to key '{Key}' with handler ID {HandlerId}", key, entry.Id);
+
+        // Сохраняем связь типа с ключом для возможности отписки по типу
+        _typeToKeyMap.AddOrUpdate(typeof(TMessage), key, (_, existing) => existing);
+
+        return new SubscriptionToken(this, key, entry.Id);
+    }
+
+    /// <summary>
+    /// Подписаться на событие по типу сообщения
+    /// </summary>
+    public IDisposable Subscribe<TMessage>(Func<TMessage, CancellationToken, ValueTask> handler)
+        where TMessage : IMessage
+    {
+        // Попробуем получить ключ из статического словаря
+        if (!_typeToStaticKeyMap.TryGetValue(typeof(TMessage), out var key))
+        {
+            // Если ключ не найден, попробуем получить его из атрибута
+            var attr = typeof(TMessage).GetCustomAttributes(false)
+                .OfType<MessageKeyAttribute>()
+                .FirstOrDefault();
+
+            if (attr != null)
+            {
+                key = attr.Key;
+                _typeToStaticKeyMap.TryAdd(typeof(TMessage), key);
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"Cannot subscribe to {typeof(TMessage).Name} without a key. " +
+                    $"Either use Subscribe(key, handler) or add [MessageKey] attribute to the message type.");
+            }
+        }
+
+        return Subscribe(key, handler);
+    }
+
+    /// <summary>
+    /// Зарегистрировать статический ключ для типа сообщения
+    /// </summary>
+    public void RegisterStaticKey<TMessage>(string key) where TMessage : IMessage
+    {
+        _typeToStaticKeyMap[typeof(TMessage)] = key;
+    }
+
+    // Остальные методы остаются без изменений...
+    // Unsubscribe, GetHandlers, GetSubscribedKeys и т.д.
+
+    /// <summary>
+    /// Отписаться от события по ключу
+    /// </summary>
+    public void Unsubscribe(string key)
+    {
+        if (_subscriptions.TryRemove(key, out var subscriptions))
+        {
+            _logger?.LogDebug("Unsubscribed from key '{Key}', removed {Count} handlers",
+                key, subscriptions.Count);
+        }
+    }
+
+    /// <summary>
+    /// Отписаться от события по типу сообщения
+    /// </summary>
+    public void Unsubscribe<TMessage>() where TMessage : IMessage
+    {
+        if (_typeToKeyMap.TryGetValue(typeof(TMessage), out var key))
+        {
+            Unsubscribe(key);
+            _typeToKeyMap.TryRemove(typeof(TMessage), out _);
+        }
+    }
+
+    /// <summary>
+    /// Внутренний метод для отписки по ID обработчика
+    /// </summary>
+    private bool Unsubscribe(string key, Guid handlerId)
+    {
+        if (_subscriptions.TryGetValue(key, out var subscriptions))
+        {
+            lock (subscriptions)
+            {
+                var removed = subscriptions.RemoveAll(x => x.Id == handlerId);
+                if (removed > 0)
+                {
+                    // Если обработчиков не осталось, удаляем ключ
+                    if (subscriptions.Count == 0)
+                    {
+                        _subscriptions.TryRemove(key, out _);
+                    }
+
+                    _logger?.LogDebug("Unsubscribed handler {HandlerId} from key '{Key}'",
+                        handlerId, key);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Получить все обработчики для указанного ключа
+    /// </summary>
+    public IEnumerable<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>
+        GetHandlers(string key)
+    {
+        if (!_subscriptions.TryGetValue(key, out var subscriptions))
+            return Enumerable.Empty<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>();
+
+        var handlers = new List<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>();
+
+        lock (subscriptions)
+        {
+            foreach (var entry in subscriptions)
+            {
+                // Создаем обертку, которая правильно приводит типы
+                handlers.Add(CreateHandlerWrapper(entry));
+            }
+        }
+
+        return handlers;
+    }
+
+    private Func<IServiceProvider, IMessage, CancellationToken, ValueTask>
+        CreateHandlerWrapper(SubscriptionEntry entry)
+    {
+        return (sp, msg, ct) =>
+        {
+            // Проверяем тип сообщения
+            if (!entry.MessageType.IsInstanceOfType(msg))
+            {
+                throw new InvalidCastException(
+                    $"Cannot cast message of type {msg.GetType()} to {entry.MessageType}");
+            }
+
+            // Получаем метод DynamicInvoke у делегата
+            var result = entry.HandlerDelegate.DynamicInvoke(msg, ct);
+
+            // Возвращаем ValueTask
+            if (result is ValueTask valueTask)
+            {
+                return valueTask;
+            }
+            else if (result is Task task)
+            {
+                return new ValueTask(task);
+            }
+            else
+            {
+                return ValueTask.CompletedTask;
+            }
+        };
+    }
+
+    /// <summary>
+    /// Получить все зарегистрированные ключи
+    /// </summary>
+    public IEnumerable<string> GetSubscribedKeys() => _subscriptions.Keys;
+
+    /// <summary>
+    /// Получить количество подписок для ключа
+    /// </summary>
+    public int GetSubscriptionCount(string key)
+    {
+        return _subscriptions.TryGetValue(key, out var subscriptions)
+            ? subscriptions.Count
+            : 0;
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            _subscriptions.Clear();
+            _typeToKeyMap.Clear();
+            _typeToStaticKeyMap.Clear();
+            _disposed = true;
+            _logger?.LogInformation("DynamicSubscriptionManager disposed");
+        }
+    }
+
+    /// <summary>
+    /// Токен подписки для отписки через Dispose
+    /// </summary>
+    private sealed class SubscriptionToken : IDisposable
+    {
+        private readonly DynamicSubscriptionManager _manager;
+        private readonly string _key;
+        private readonly Guid _handlerId;
+        private bool _disposed;
+
+        public SubscriptionToken(DynamicSubscriptionManager manager, string key, Guid handlerId)
+        {
+            _manager = manager;
+            _key = key;
+            _handlerId = handlerId;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                _manager.Unsubscribe(_key, _handlerId);
+                _disposed = true;
+            }
+        }
+    }
+}
+-----
+// EventHandlerRegistry.cs
+
+namespace BusLibrary02.Core;
+
+using Microsoft.Extensions.DependencyInjection;
+using System.Reflection;
+
+public sealed class EventHandlerRegistry : IEventHandlerRegistry
+{
+    private readonly Dictionary<string, List<Type>> _handlerMap;
+    private readonly List<Type> _handlerTypes;
+
+    public EventHandlerRegistry(IEnumerable<Assembly> assemblies)
+    {
+        _handlerMap = new Dictionary<string, List<Type>>(StringComparer.OrdinalIgnoreCase);
+        _handlerTypes = new List<Type>();
+
+        DiscoverHandlers(assemblies);
+    }
+
+    private void DiscoverHandlers(IEnumerable<Assembly> assemblies)
+    {
+        foreach (var assembly in assemblies)
+        {
+            try
+            {
+                var types = assembly.GetTypes()
+                    .Where(t => !t.IsAbstract && !t.IsInterface)
+                    .Where(t => t.GetCustomAttributes<HandlesAttribute>().Any())
+                    .Where(t => t.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IMessageHandler<>)));
+
+                foreach (var type in types)
+                {
+                    _handlerTypes.Add(type);
+                    var attributes = type.GetCustomAttributes<HandlesAttribute>();
+
+                    foreach (var attr in attributes)
+                    {
+                        if (!_handlerMap.TryGetValue(attr.Key, out var list))
+                        {
+                            list = new List<Type>();
+                            _handlerMap[attr.Key] = list;
+                        }
+
+                        if (!list.Contains(type))
+                            list.Add(type);
+                    }
+                }
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                Console.WriteLine($"Ошибка загрузки типов из сборки {assembly}: {ex.Message}");
+            }
+        }
+    }
+
+    public void RegisterHandlers(IServiceCollection services)
+    {
+        foreach (var handlerType in _handlerTypes)
+            services.AddSingleton(handlerType);
+    }
+
+    public IEnumerable<Type> GetHandlerTypes() => _handlerTypes;
+
+    public System.Collections.Generic.IDictionary<string, List<Type>> GetHandlerMap() =>
+        _handlerMap.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.ToList());
+}
+----
+Сейчас будет продолжение.
+ПОка ничего не делай
+
+### ASSISTANT
+Принято. Жду продолжение.
+
+### USER
+----
+// EventHub.cs
+
+using Microsoft.Extensions.Logging;
+using System.Threading.Channels;
+
+namespace BusLibrary02.Core;
+
+// EventHub.cs ( 25.12.14 исправленный InProcessEventHub)
+public sealed class InProcessEventHub : IEventHub, IAsyncDisposable
+{
+    private readonly IServiceProvider _serviceProvider;
+    private readonly IKeyRouter _router;
+    private readonly IKeyCatalog? _catalog;
+    private readonly Channel<IMessage> _channel;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly Task _pump;
+    private readonly ILogger<InProcessEventHub>? _logger;
+    private bool _disposed;
+    private readonly int dispose_timeout_in_seconds = 5;
+
+    public InProcessEventHub(IServiceProvider serviceProvider, IKeyRouter router, IKeyCatalog? catalog = null, int capacity = 8192, ILogger<InProcessEventHub>? logger = null)
+    {
+        _serviceProvider = serviceProvider;
+        _router = router;
+        _catalog = catalog;
+        _logger = logger;
+        _channel = Channel.CreateBounded<IMessage>(new BoundedChannelOptions(capacity) { SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.Wait });
+        _logger?.LogInformation("EventHub pump task starting...");
+        _pump = Task.Run(RunAsync);
+        _logger?.LogInformation("EventHub pump task started.");
+    }
+
+    public async ValueTask PublishAsync(IMessage message, CancellationToken ct = default)
+    {
+        try
+        {
+            _logger?.LogDebug($"Publishing message with key '{message.Key}'.");
+            await _channel.Writer.WriteAsync(message, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger?.LogDebug("PublishAsync cancelled for message with key '{Key}'.", message.Key);
+            // Не пробрасываем исключение дальше - это нормально при остановке
+        }
+        catch (ChannelClosedException)
+        {
+            _logger?.LogDebug("Channel closed, cannot publish message with key '{Key}'.", message.Key);
+            // Канал закрыт, EventHub останавливается
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Error publishing message with key '{Key}'.", message.Key);
+            // Для других исключений можно пробросить дальше или обработать по-другому
+            throw;
+        }
+    }
+
+    public async ValueTask PublishAsync(long keyId, IMessage message, CancellationToken ct = default)
+    {
+        try
+        {
+            if (_catalog is null) throw new InvalidOperationException("IKeyCatalog is not configured.");
+            if (!_catalog.TryGetString(keyId, out var key)) throw new KeyNotFoundException($"KeyId {keyId} not found in catalog.");
+            if (!string.Equals(message.Key, key, StringComparison.OrdinalIgnoreCase)) message = new RoutedWrapper(message, key);
+            await PublishAsync(message, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger?.LogDebug("PublishAsync by keyId cancelled for keyId '{KeyId}'.", keyId);
+            // Не пробрасываем исключение дальше
+        }
+        catch (Exception ex) when (ex is not (OperationCanceledException or ChannelClosedException))
+        {
+            _logger?.LogError(ex, "Error publishing message by keyId '{KeyId}'.", keyId);
+            throw;
+        }
+    }
+
+    private async Task RunAsync()
+    {
+        _logger?.LogDebug("EventHub RunAsync loop started.");
+        try
+        {
+            while (await _channel.Reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
+            {
+                _logger?.LogDebug("EventHub RunAsync: Channel has messages to read.");
+                while (_channel.Reader.TryRead(out var message))
+                {
+                    _logger?.LogDebug($"EventHub RunAsync: Processing message with key '{message.Key}'.");
+                    var handlers = _router.Resolve(_serviceProvider, message.Key);
+                    _logger?.LogDebug($"EventHub RunAsync: Found {handlers.Count()} handlers for key '{message.Key}'.");
+
+                    foreach (var h in handlers)
+                    {
+                        try
+                        {
+                            await h(_serviceProvider, message, _cts.Token).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Не логируем TaskCanceledException как ошибку
+                            if (ex is not (OperationCanceledException or TaskCanceledException))
+                            {
+                                _logger?.LogError(ex, "Error in message handler for key '{MessageKey}'.", message.Key);
+                            }
+                            else
+                            {
+                                _logger?.LogDebug("Handler cancelled for key '{MessageKey}'.", message.Key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger?.LogDebug("EventHub RunAsync loop cancelled.");
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "EventHub RunAsync loop error.");
+        }
+    }
+
+    private sealed record RoutedWrapper(IMessage Inner, string NewKey) : IMessage
+    {
+        public string Key => NewKey;
+        public string? SenderKey => Inner.SenderKey;
+        public DateTimeOffset CreatedAt => Inner.CreatedAt;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        try
+        {
+            _logger?.LogInformation("EventHub disposing, starting graceful shutdown...");
+
+            // 1. Прекращаем принимать новые сообщения
+            _channel.Writer.TryComplete();
+
+            // 2. Даем время на обработку оставшихся сообщений
+            var gracefulShutdownTimeout = TimeSpan.FromSeconds(3);
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            // Ждем, пока канал не опустеет или не истечет время
+            while (!_channel.Reader.Completion.IsCompleted &&
+                   stopwatch.Elapsed < gracefulShutdownTimeout)
+            {
+                await Task.Delay(100).ConfigureAwait(false);
+            }
+
+            _logger?.LogInformation("EventHub: Graceful shutdown completed, remaining messages: {Count}",
+                _channel.Reader.Count);
+
+            // 3. Отменяем токен
+            _cts.Cancel();
+        }
+        catch (ObjectDisposedException) { return; }
+
+        try
+        {
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(dispose_timeout_in_seconds));
+            var completedTask = await Task.WhenAny(_pump, timeoutTask).ConfigureAwait(false);
+            if (completedTask != _pump)
+            {
+                _logger?.LogWarning("EventHub disposal: Pump did not finish in time, forcing cancellation.");
+                _cts.Cancel();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Error during EventHub disposal.");
+        }
+        finally
+        {
+            _cts.Dispose();
+        }
+
+        _logger?.LogInformation("EventHub disposed.");
+    }
+}
+--
+// Extensions.cs (обновленная версия)
+
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using System.Reflection;
+
+namespace BusLibrary02.Core;
+
+public static class EventHubServiceCollectionExtensions
+{
+    public static IServiceCollection AddEventHub(this IServiceCollection services,
+        Action<EventHubOptions>? configure = null)
+    {
+        var opts = new EventHubOptions();
+        configure?.Invoke(opts);
+
+        // Собираем все сборки, в которых искать обработчики
+        var assemblies = new List<Assembly>();
+
+        // Добавляем сборки из опций
+        if (opts.Assemblies?.Any() == true)
+        {
+            assemblies.AddRange(opts.Assemblies);
+        }
+
+        // Если сборки не указаны, добавляем сборку вызывающего кода
+        if (!assemblies.Any())
+        {
+            assemblies.Add(Assembly.GetCallingAssembly());
+        }
+
+        // Создаем реестр обработчиков
+        var registry = new EventHandlerRegistry(assemblies);
+
+        // Регистрируем реестр в DI
+        services.AddSingleton<IEventHandlerRegistry>(registry);
+
+        // Регистрируем обработчики в DI
+        registry.RegisterHandlers(services);
+
+        // Регистрируем менеджер динамических подписок
+        services.AddSingleton<DynamicSubscriptionManager>();
+        services.AddSingleton<IDynamicSubscriptionManager>(sp =>
+            sp.GetRequiredService<DynamicSubscriptionManager>());
+
+        // Регистрируем композитный роутер
+        services.AddSingleton<IKeyRouter, CompositeKeyRouter>();
+
+        if (opts.Catalog is not null)
+        {
+            services.AddSingleton<IKeyCatalog>(opts.Catalog);
+        }
+
+        // Регистрируем EventHub
+        services.AddSingleton<IEventHub>(serviceProvider =>
+        {
+            var router = serviceProvider.GetRequiredService<IKeyRouter>();
+            var catalog = serviceProvider.GetService<IKeyCatalog>();
+            var logger = serviceProvider.GetService<ILogger<InProcessEventHub>>();
+
+            return new InProcessEventHub(serviceProvider, router, catalog,
+                opts.ChannelCapacity, logger);
+        });
+
+        return services;
+    }
+
+    public sealed class EventHubOptions
+    {
+        public int ChannelCapacity { get; set; } = 8192;
+        public IKeyCatalog? Catalog { get; set; }
+        public IReadOnlyCollection<Assembly>? Assemblies { get; set; }
+    }
+}
+----
+// Interfaces.cs
+
+namespace BusLibrary02.Core;
+
+public interface IMessage
+{
+    string Key { get; }
+    string? SenderKey { get; }
+    DateTimeOffset CreatedAt { get; }
+}
+
+public interface IKeyCatalog
+{
+    bool TryGetString(long keyId, out string key);
+    bool TryGetId(string key, out long keyId);
+}
+
+public interface IMessageHandler<in TMessage> where TMessage : IMessage
+{
+    ValueTask Handle(TMessage message, CancellationToken ct);
+}
+
+public interface IEventHub
+{
+    ValueTask PublishAsync(IMessage message, CancellationToken ct = default);
+    ValueTask PublishAsync(long keyId, IMessage message, CancellationToken ct = default);
+}
+
+public interface IKeyRouter
+{
+    IEnumerable<Func<IServiceProvider, IMessage, CancellationToken, ValueTask>>
+        Resolve(IServiceProvider serviceProvider, string key);
+}
+
+public interface IEventHubModule
+{
+    IEnumerable<System.Reflection.Assembly> GetHandlerAssemblies();
+    IEnumerable<System.Reflection.Assembly> GetEventAssemblies();
+    IEnumerable<KeyValuePair<string, string>>? GetStaticKeys() => null;
+}
+
+public interface IEventHandlerRegistry
+{
+    void RegisterHandlers(Microsoft.Extensions.DependencyInjection.IServiceCollection services);
+    IEnumerable<Type> GetHandlerTypes();
+    System.Collections.Generic.IDictionary<string, List<Type>> GetHandlerMap();
+}
+
+----
+// Keys.cs
+
+namespace BusLibrary02.Core;
+
+public static class Keys
+{
+    public static string Of(string service, string handler, string? version = null) => version is null ? $"{service}:{handler}" : $"{service}:{handler}:{version}";
+    public static class A { public const string Ping = "a:ping:v1"; public const string Notify = "a:notify"; }
+    public static class B { public const string Pong = "b:pong:v1"; public const string Audit = "b:audit"; }
+    public static class C { public const string Job = "c:job"; }
+}
+----
+// MessageKeyAttribute.cs
+
+using System;
+
+namespace BusLibrary02.Core
+{
+    /// <summary>
+    /// Атрибут для указания ключа сообщения
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct, Inherited = false, AllowMultiple = false)]
+    public sealed class MessageKeyAttribute : Attribute
+    {
+        public string Key { get; }
+
+        public MessageKeyAttribute(string key)
+        {
+            Key = key ?? throw new ArgumentNullException(nameof(key));
+        }
+    }
+}
+---
+// StaticMessageExtensions.cs
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace BusLibrary02.Core;
+/// <summary>
+/// Интерфейс для сообщений со статическим ключом
+/// </summary>
+public interface IStaticKeyMessage
+{
+    /// <summary>
+    /// Статический ключ сообщения (без создания экземпляра)
+    /// </summary>
+    static abstract string StaticKey { get; }
+}
+----
+// SubscriptionExtensions.cs (исправленные)
+
+namespace BusLibrary02.Core;
+
+public static class SubscriptionExtensions
+{
+    /// <summary>
+    /// Подписаться на событие по ключу (синхронный обработчик)
+    /// </summary>
+    public static IDisposable Subscribe<TMessage>(
+        this IDynamicSubscriptionManager manager,
+        string key,
+        Action<TMessage> handler)
+        where TMessage : IMessage
+    {
+        return manager.Subscribe<TMessage>(key, (msg, ct) =>
+        {
+            handler(msg);
+            return ValueTask.CompletedTask;
+        });
+    }
+
+    /// <summary>
+    /// Подписаться на событие по типу сообщения (синхронный обработчик)
+    /// </summary>
+    public static IDisposable Subscribe<TMessage>(
+        this IDynamicSubscriptionManager manager,
+        Action<TMessage> handler)
+        where TMessage : IMessage
+    {
+        return manager.Subscribe<TMessage>((msg, ct) =>
+        {
+            handler(msg);
+            return ValueTask.CompletedTask;
+        });
+    }
+
+    /// <summary>
+    /// Подписаться на событие по ключу (асинхронный обработчик без CancellationToken)
+    /// </summary>
+    public static IDisposable Subscribe<TMessage>(
+        this IDynamicSubscriptionManager manager,
+        string key,
+        Func<TMessage, ValueTask> handler)
+        where TMessage : IMessage
+    {
+        return manager.Subscribe<TMessage>(key, async (msg, ct) =>
+        {
+            await handler(msg);
+        });
+    }
+
+    /// <summary>
+    /// Подписаться на событие по типу сообщения (асинхронный обработчик без CancellationToken)
+    /// </summary>
+    public static IDisposable Subscribe<TMessage>(
+        this IDynamicSubscriptionManager manager,
+        Func<TMessage, ValueTask> handler)
+        where TMessage : IMessage
+    {
+        return manager.Subscribe<TMessage>(async (msg, ct) =>
+        {
+            await handler(msg);
+        });
+    }
+
+    /// <summary>
+    /// Зарегистрировать статический ключ для типа сообщения
+    /// </summary>
+    public static void RegisterStaticKey<TMessage>(
+        this IDynamicSubscriptionManager manager,
+        string key) where TMessage : IMessage
+    {
+        if (manager is DynamicSubscriptionManager dsm)
+        {
+            dsm.RegisterStaticKey<TMessage>(key);
+        }
+        else
+        {
+            throw new InvalidOperationException("Manager does not support static key registration");
+        }
+    }
+}
+----
+
+### ASSISTANT
+Спасибо за предоставленный код библиотеки BusLibrary02.Core. Я изучаю вашу реализацию системы событий с использованием каналов и различных типов маршрутизации.
+
+Вижу, что у вас реализованы следующие ключевые компоненты:
+
+1. **Сообщения** - с базовым классом `MessageBase` и атрибутом `HandlesAttribute` для статических подписок
+2. **Маршрутизация** - через `IKeyRouter` с поддержкой как атрибутной (`AttributeKeyRouter`), так и динамической (`CompositeKeyRouter`)
+3. **Динамические подписки** - через `DynamicSubscriptionManager` с поддержкой `IDisposable` токенов
+4. **Обработчики** - через интерфейс `IMessageHandler<TMessage>`
+5. **Центр событий** - `InProcessEventHub` на базе `Channel<T>` с асинхронной обработкой
+6. **Регистрация** - через расширения `IServiceCollection.AddEventHub()`
+
+Код демонстрирует хорошие практики:
+- Использование асинхронности (`ValueTask`)
+- Правильную обработку отмены (`CancellationToken`)
+- Управление ресурсами (`IAsyncDisposable`)
+- Логирование
+- Обработку ошибок
+- Поддержку как статических, так и динамических подписок
+
+Какие-то конкретные вопросы или аспекты реализации вас интересуют? Я готов обсудить архитектурные решения, возможные улучшения или помощь с интеграцией.
+
+### USER
+Я планировал использовать этот EventHub в проектах NetCore для взаимодействия между Backgroundservices. Мы регистрируем Singletone<EventHub>  в AspNetCore и далее работаем через Сообщения. Но Почему-то всепытаютсянаследоваться от него.
+Вот примерно так
+public class EventHubTickerManager
+{
+    private readonly List<EventHubTicker> _tickers = new();
+    private readonly IEventHub _eventHub;
+    private readonly ILogger<EventHubTickerManager> _logger;
+    private readonly ILoggerFactory _loggerFactory;
+
+    public EventHubTickerManager(
+        IEventHub eventHub,
+        ILoggerFactory loggerFactory,
+        ILogger<EventHubTickerManager> logger)
+    {
+        _eventHub = eventHub;
+        _loggerFactory = loggerFactory;
+        _logger = logger;
+
+        InitializeTickers();
+        NotifyStrategiesInitialized();
+    }
+
+    private void InitializeTickers()
+------
+ или вот так
+    public class EventHubStrategy : EventDrivenRandomStrategy01
+    {
+        private readonly IEventHub _eventHub;
+        private readonly ILogger<EventHubStrategy>? _logger;
+
+        // Используем Reflection для доступа к приватному полю _currentAction
+        private TradingAction GetCurrentAction()
+        {
+            var field = typeof(EventDrivenRandomStrategy01).GetField("_currentAction",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            return (TradingAction)field?.GetValue(this)!;
+        }
+
+        private bool GetIsRunning()
+        {
+            var field = typeof(EventDrivenRandomStrategy01).GetField("_isRunning",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            return (bool)field?.GetValue(this)!;
+        }
+
+        public EventHubStrategy(string ticker, int cycleTicks, string strategyName,
+            IEventHub eventHub, ILogger<EventHubStrategy>? logger = null)
+            : base(ticker, cycleTicks, strategyName)
+        {
+            _eventHub = eventHub;
+            _logger = logger;
+
+            // Подписываемся на события стратегии и публикуем их через EventHub
+            this.OnTradeExecuted += OnTradeExecutedHandler;
+            this.OnDealClosed += OnDealClosedHandler;
+            this.OnPositionChanged += OnPositionChangedHandler;
+            this.OnOrderCreated += OnOrderCreatedHandler;
+
+            _logger?.LogDebug("Создана стратегия {Name} для {Ticker}", strategyName, ticker);
+        }
+
+        public new void StartTrading(CancellationToken cancellationToken = default)
+        {
+            base.StartTrading(cancellationToken);
+
+            _logger?.LogInformation("Стратегия {Name} для {Ticker} запущена",
+                StrategyName, Ticker);
+
+            // Публикуем событие о запуске стратегии
+            _ = _eventHub.PublishAsync(new SystemStatusEvent(
+                "Strategy",
+                "Started",
+                $"Стратегия {StrategyName} для {Ticker} запущена",
+                DateTime.Now
+            ));
+        }
+
+        public new void StopTrading()
+        {
+            base.StopTrading();
+
+            _logger?.LogInformation("Стратегия {Name} для {Ticker} остановлена",
+                StrategyName, Ticker);
+
+            // Публикуем событие об остановке стратегии
+            _ = _eventHub.PublishAsync(new SystemStatusEvent(
+                "Strategy",
+                "Stopped",
+                $"Стратегия {StrategyName} для {Ticker} остановлена",
+                DateTime.Now
+            ));
+        }
+
+        // Добавляем публичный метод IsRunning для проверки статуса стратегии
+        public bool IsRunning() => GetIsRunning();
+
+        // Добавляем метод для получения периода стратегии
+        public int GetCycleTicks()
+        {
+            // Получаем приватное поле _cycleTicks через рефлексию
+            var field = typeof(EventDrivenRandomStrategy01).GetField("_cycleTicks",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            return field != null ? (int)field.GetValue(this)! : 10;
+        }
+
+        private async void OnTradeExecutedHandler(ITrade trade)
+        {
+            if (!IsRunning()) return;
+
+            try
+            {
+                var tradeEvent = new TradeExecutedEvent(
+                    trade.Ticker,
+                    trade.Side.ToString(),
+                    trade.Price,
+                    trade.Qty,
+                    StrategyName,
+                    trade.DateTime
+                );
+
+                await _eventHub.PublishAsync(tradeEvent);
+                _logger?.LogDebug("Опубликовано событие TradeExecuted: {Ticker} {Side}",
+                    trade.Ticker, trade.Side);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Ошибка при публикации события TradeExecuted");
+            }
+        }
+
+        private async void OnDealClosedHandler(IDeal deal)
+        {
+            if (!IsRunning()) return;
+
+            try
+            {
+                var dealEvent = new DealClosedEvent(
+                    deal.Ticker,
+                    deal.Number,
+                    deal.Side.ToString(),
+                    deal.Qty,
+                    deal.OpenPrice,
+                    deal.ClosePrice,
+                    deal.PnL,
+                    deal.DateTime
+                );
+
+                await _eventHub.PublishAsync(dealEvent);
+                _logger?.LogDebug("Опубликовано событие DealClosed: {Ticker} PnL={PnL}",
+                    deal.Ticker, deal.PnL);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Ошибка при публикации события DealClosed");
+            }
+        }
+
+        private async void OnPositionChangedHandler(IPositionSummary position)
+        {
+            if (!IsRunning()) return;
+
+            try
+            {
+                var positionEvent = new PositionChangedEvent(
+                    position.Ticker,
+                    position.NetQuantity,
+                    position.UnrealizedProfit,
+                    position.Status.ToString(),
+                    DateTime.Now
+                );
+
+                await _eventHub.PublishAsync(positionEvent);
+                _logger?.LogDebug("Опубликовано событие PositionChanged: {Ticker} NetQty={NetQty}",
+                    position.Ticker, position.NetQuantity);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Ошибка при публикации события PositionChanged");
+            }
+        }
+
+        private async void OnOrderCreatedHandler(IOrder order)
+        {
+            if (!IsRunning()) return;
+
+            try
+            {
+                var orderEvent = new OrderCreatedEvent(
+                    order.Ticker,
+                    order.Side.ToString(),
+                    order.Price,
+                    order.Qty,
+                    order.Status.ToString(),
+                    order.OrderNumber.ToString(),
+                    order.DateTime
+                );
+
+                await _eventHub.PublishAsync(orderEvent);
+                _logger?.LogDebug("Опубликовано событие OrderCreated: {Ticker} {Side}",
+                    order.Ticker, order.Side);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Ошибка при публикации события OrderCreated");
+            }
+        }
+
+        public override void ProcessTick(ITick tick)
+        {
+            if (!IsRunning()) return;
+
+            try
+            {
+                base.ProcessTick(tick);
+
+                // Публикуем сигнал стратегии
+                var currentAction = GetCurrentAction();
+                var signalEvent = new StrategySignalEvent(
+                    tick.Ticker,
+                    StrategyName,
+                    currentAction.ToString(),
+                    tick.Price,
+                    1,
+                    tick.DateTime
+                );
+
+                _ = _eventHub.PublishAsync(signalEvent);
+
+                //_logger?.LogTrace("Стратегия {Name} обработала тик: {Ticker} {Price}",
+                //    StrategyName, tick.Ticker, tick.Price);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Ошибка в ProcessTick стратегии {Name}", StrategyName);
+            }
+        }
+    }
+}
+---
+Чтоэто дает ?
+
+### ASSISTANT
+Ваши примеры показывают два разных подхода к интеграции EventHub в существующую систему:
+
+**Первый пример (EventHubTickerManager):**
+- Создает менеджер, который управляет коллекцией тикеров
+- Использует EventHub для уведомления о завершении инициализации
+- Это более чистый подход - класс сам по себе, использует EventHub как зависимость
+
+**Второй пример (EventHubStrategy):**
+- Наследуется от существующего класса стратегии
+- Проксирует события через EventHub
+- Использует рефлексию для доступа к приватным полям родительского класса
+- Переопределяет методы для добавления публикации событий
+
+**Проблемы с текущим подходом:**
+
+1. **Наследование используется неправильно** - вы не расширяете функциональность, а просто добавляете событийную логику
+2. **Рефлексия** - нарушает инкапсуляцию и делает код хрупким к изменениям
+3. **Асинхронные void методы** - потенциальные проблемы с обработкой ошибок
+4. **Смешение ответственностей** - стратегия должна заниматься торговлей, а не публикацией событий
+
+**Рекомендуемый подход:**
+
+Вместо наследования используйте паттерн **Adapter** или **Decorator**:
+
+```csharp
+// Вместо наследования - композиция
+public class EventHubStrategyAdapter
+{
+    private readonly EventDrivenRandomStrategy01 _strategy;
+    private readonly IEventHub _eventHub;
+    private readonly ILogger<EventHubStrategyAdapter> _logger;
+
+    public EventHubStrategyAdapter(
+        EventDrivenRandomStrategy01 strategy,
+        IEventHub eventHub,
+        ILogger<EventHubStrategyAdapter> logger)
+    {
+        _strategy = strategy;
+        _eventHub = eventHub;
+        _logger = logger;
+
+        // Подписываемся на события оригинальной стратегии
+        _strategy.OnTradeExecuted += OnTradeExecutedHandler;
+        _strategy.OnDealClosed += OnDealClosedHandler;
+        // и т.д.
+    }
+
+    // Реализуем те же интерфейсы, что и оригинальная стратегия
+    public void StartTrading(CancellationToken cancellationToken = default)
+    {
+        _strategy.StartTrading(cancellationToken);
+        // Публикуем событие через EventHub
+    }
+
+    public void ProcessTick(ITick tick) => _strategy.ProcessTick(tick);
+
+    // Делегируем свойства
+    public string StrategyName => _strategy.StrategyName;
+    
+    // Обработчики событий, публикующие в EventHub
+    private async void OnTradeExecutedHandler(ITrade trade)
+    {
+        var tradeEvent = new TradeExecutedEvent(/*...*/);
+        await _eventHub.PublishAsync(tradeEvent);
+    }
+}
+```
+
+**Преимущества EventHub в BackgroundServices:**
+- Полная декомпозиция компонентов
+- Асинхронная обработка без блокировок
+- Возможность динамических подписок
+- Централизованная обработка ошибок
+- Мониторинг и логирование событий
+
+Ваша архитектура правильная, но реализация через наследование усложняет систему. Лучше использовать композицию и делегирование.
+
+### USER
+"Ваша архитектура правильная, но реализация через наследование усложняет систему. Лучше использовать композицию и делегирование."
+Нпиши примеры "композицию и делегирование"
+
+### ASSISTANT
+Вот примеры подходов "композиция и делегирование" для вашей системы:
+
+**1. Для стратегии (вместо наследования):**
+
+```csharp
+public class EventHubStrategy : IStrategy, IDisposable
+{
+    private readonly EventDrivenRandomStrategy01 _innerStrategy;
+    private readonly IEventHub _eventHub;
+    private readonly ILogger<EventHubStrategy> _logger;
+    private readonly IDisposable _tradeSubscription;
+    private readonly IDisposable _dealSubscription;
+    private readonly IDisposable _positionSubscription;
+    private readonly IDisposable _orderSubscription;
+
+    public EventHubStrategy(
+        EventDrivenRandomStrategy01 innerStrategy,
+        IEventHub eventHub,
+        ILogger<EventHubStrategy> logger)
+    {
+        _innerStrategy = innerStrategy ?? throw new ArgumentNullException(nameof(innerStrategy));
+        _eventHub = eventHub ?? throw new ArgumentNullException(nameof(eventHub));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        // Подписываемся на события внутренней стратегии
+        _tradeSubscription = SubscribeToTradeEvents();
+        _dealSubscription = SubscribeToDealEvents();
+        _positionSubscription = SubscribeToPositionEvents();
+        _orderSubscription = SubscribeToOrderEvents();
+    }
+
+    private IDisposable SubscribeToTradeEvents()
+    {
+        return EventSubscriptionHelper.SubscribeToEvent(
+            _innerStrategy, 
+            "OnTradeExecuted", 
+            (ITrade trade) => OnTradeExecutedHandler(trade));
+    }
+
+    private IDisposable SubscribeToDealEvents()
+    {
+        return EventSubscriptionHelper.SubscribeToEvent(
+            _innerStrategy, 
+            "OnDealClosed", 
+            (IDeal deal) => OnDealClosedHandler(deal));
+    }
+
+    private IDisposable SubscribeToPositionEvents()
+    {
+        return EventSubscriptionHelper.SubscribeToEvent(
+            _innerStrategy, 
+            "OnPositionChanged", 
+            (IPositionSummary position) => OnPositionChangedHandler(position));
+    }
+
+    private IDisposable SubscribeToOrderEvents()
+    {
+        return EventSubscriptionHelper.SubscribeToEvent(
+            _innerStrategy, 
+            "OnOrderCreated", 
+            (IOrder order) => OnOrderCreatedHandler(order));
+    }
+
+    public void StartTrading(CancellationToken cancellationToken = default)
+    {
+        _innerStrategy.StartTrading(cancellationToken);
+        
+        var statusEvent = new SystemStatusEvent(
+            "Strategy",
+            "Started",
+            $"Стратегия {_innerStrategy.StrategyName} для {_innerStrategy.Ticker} запущена",
+            DateTime.Now
+        );
+        _ = _eventHub.PublishAsync(statusEvent);
+    }
+
+    public void StopTrading()
+    {
+        _innerStrategy.StopTrading();
+        
+        var statusEvent = new SystemStatusEvent(
+            "Strategy",
+            "Stopped",
+            $"Стратегия {_innerStrategy.StrategyName} для {_innerStrategy.Ticker} остановлена",
+            DateTime.Now
+        );
+        _ = _eventHub.PublishAsync(statusEvent);
+    }
+
+    public void ProcessTick(ITick tick) => _innerStrategy.ProcessTick(tick);
+
+    // Делегирование свойств
+    public string StrategyName => _innerStrategy.StrategyName;
+    public string Ticker => _innerStrategy.Ticker;
+    public bool IsRunning => GetIsRunningFromInnerStrategy();
+    public int CycleTicks => GetCycleTicksFromInnerStrategy();
+
+    private bool GetIsRunningFromInnerStrategy()
+    {
+        var field = _innerStrategy.GetType()
+            .GetField("_isRunning", BindingFlags.NonPublic | BindingFlags.Instance);
+        return field != null ? (bool)field.GetValue(_innerStrategy) : false;
+    }
+
+    private int GetCycleTicksFromInnerStrategy()
+    {
+        var field = _innerStrategy.GetType()
+            .GetField("_cycleTicks", BindingFlags.NonPublic | BindingFlags.Instance);
+        return field != null ? (int)field.GetValue(_innerStrategy) : 10;
+    }
+
+    private async void OnTradeExecutedHandler(ITrade trade)
+    {
+        try
+        {
+            var tradeEvent = new TradeExecutedEvent(
+                trade.Ticker,
+                trade.Side.ToString(),
+                trade.Price,
+                trade.Qty,
+                StrategyName,
+                trade.DateTime
+            );
+            await _eventHub.PublishAsync(tradeEvent);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Ошибка при публикации события TradeExecuted");
+        }
+    }
+
+    private async void OnDealClosedHandler(IDeal deal)
+    {
+        try
+        {
+            var dealEvent = new DealClosedEvent(
+                deal.Ticker,
+                deal.Number,
+                deal.Side.ToString(),
+                deal.Qty,
+                deal.OpenPrice,
+                deal.ClosePrice,
+                deal.PnL,
+                deal.DateTime
+            );
+            await _eventHub.PublishAsync(dealEvent);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Ошибка при публикации события DealClosed");
+        }
+    }
+
+    // Остальные обработчики событий...
+
+    public void Dispose()
+    {
+        _tradeSubscription?.Dispose();
+        _dealSubscription?.Dispose();
+        _positionSubscription?.Dispose();
+        _orderSubscription?.Dispose();
+    }
+}
+
+// Вспомогательный класс для подписки на события через рефлексию
+public static class EventSubscriptionHelper
+{
+    public static IDisposable SubscribeToEvent<TEventArgs>(
+        object source, 
+        string eventName, 
+        Action<TEventArgs> handler)
+    {
+        var eventInfo = source.GetType().GetEvent(eventName);
+        if (eventInfo == null)
+            throw new ArgumentException($"Event {eventName} not found in {source.GetType()}");
+
+        var eventHandler = new EventHandler<TEventArgs>(
+            (sender, args) => handler(args));
+        
+        eventInfo.AddEventHandler(source, eventHandler);
+
+        return new EventUnsubscriber(eventInfo, source, eventHandler);
+    }
+
+    private class EventUnsubscriber : IDisposable
+    {
+        private readonly EventInfo _eventInfo;
+        private readonly object _source;
+        private readonly Delegate _handler;
+        private bool _disposed;
+
+        public EventUnsubscriber(EventInfo eventInfo, object source, Delegate handler)
+        {
+            _eventInfo = eventInfo;
+            _source = source;
+            _handler = handler;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                _eventInfo.RemoveEventHandler(_source, _handler);
+                _disposed = true;
+            }
+        }
+    }
+}
+```
+
+**2. Для менеджера тикеров:**
+
+```csharp
+public class EventHubTickerManager : IDisposable
+{
+    private readonly Dictionary<string, EventHubStrategy> _tickerStrategies = new();
+    private readonly IEventHub _eventHub;
+    private readonly ILogger<EventHubTickerManager> _logger;
+    private readonly ILoggerFactory _loggerFactory;
+
+    public EventHubTickerManager(
+        IEventHub eventHub,
+        ILoggerFactory loggerFactory,
+        ILogger<EventHubTickerManager> logger)
+    {
+        _eventHub = eventHub ?? throw new ArgumentNullException(nameof(eventHub));
+        _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    public void AddStrategy(EventDrivenRandomStrategy01 baseStrategy)
+    {
+        var eventHubStrategy = new EventHubStrategy(
+            baseStrategy, 
+            _eventHub, 
+            _loggerFactory.CreateLogger<EventHubStrategy>());
+
+        _tickerStrategies[baseStrategy.Ticker] = eventHubStrategy;
+    }
+
+    public EventHubStrategy GetStrategy(string ticker)
+    {
+        return _tickerStrategies.TryGetValue(ticker, out var strategy) 
+            ? strategy 
+            : throw new KeyNotFoundException($"Strategy for ticker {ticker} not found");
+    }
+
+    public void InitializeAllStrategies()
+    {
+        foreach (var strategy in _tickerStrategies.Values)
+        {
+            // Здесь можно добавить логику инициализации
+        }
+
+        // Публикуем событие об инициализации всех стратегий
+        var initEvent = new SystemStatusEvent(
+            "TickerManager",
+            "Initialized",
+            $"Инициализировано {_tickerStrategies.Count} стратегий",
+            DateTime.Now
+        );
+        _ = _eventHub.PublishAsync(initEvent);
+    }
+
+    public void StartAllStrategies(CancellationToken cancellationToken = default)
+    {
+        foreach (var strategy in _tickerStrategies.Values)
+        {
+            strategy.StartTrading(cancellationToken);
+        }
+    }
+
+    public void StopAllStrategies()
+    {
+        foreach (var strategy in _tickerStrategies.Values)
+        {
+            strategy.StopTrading();
+        }
+    }
+
+    public void ProcessTick(ITick tick)
+    {
+        if (_tickerStrategies.TryGetValue(tick.Ticker, out var strategy))
+        {
+            strategy.ProcessTick(tick);
+        }
+    }
+
+    public void Dispose()
+    {
+        foreach (var strategy in _tickerStrategies.Values)
+        {
+            strategy.Dispose();
+        }
+        _tickerStrategies.Clear();
+    }
+}
+```
+
+**3. Регистрация в DI:**
+
+```csharp
+// В Startup/Program.cs
+services.AddSingleton<IEventHub>(sp =>
+{
+    var serviceProvider = sp;
+    var router = sp.GetRequiredService<IKeyRouter>();
+    var catalog = sp.GetService<IKeyCatalog>();
+    var logger = sp.GetService<ILogger<InProcessEventHub>>();
+    
+    return new InProcessEventHub(serviceProvider, router, catalog, 8192, logger);
+});
+
+// Регистрируем фабрику для создания адаптированных стратегий
+services.AddSingleton<IStrategyFactory, EventHubStrategyFactory>();
+
+public interface IStrategyFactory
+{
+    EventHubStrategy CreateStrategy(EventDrivenRandomStrategy01 baseStrategy);
+}
+
+public class EventHubStrategyFactory : IStrategyFactory
+{
+    private readonly IServiceProvider _serviceProvider;
+
+    public EventHubStrategyFactory(IServiceProvider serviceProvider)
+    {
+        _serviceProvider = serviceProvider;
+    }
+
+    public EventHubStrategy CreateStrategy(EventDrivenRandomStrategy01 baseStrategy)
+    {
+        var eventHub = _serviceProvider.GetRequiredService<IEventHub>();
+        var logger = _serviceProvider.GetRequiredService<ILogger<EventHubStrategy>>();
+        
+        return new EventHubStrategy(baseStrategy, eventHub, logger);
+    }
+}
+```
+
+**Преимущества этого подхода:**
+- Четкое разделение ответственностей
+- Легче тестировать отдельные компоненты
+- Нет жесткой зависимости от наследования
+- Возможность замены внутренней реализации без изменения внешнего интерфейса
+- Лучшая поддержка и расширяемость
+
+### USER
+Я не понимаю одного.
+Я создал EventHub - абстракцию для обмена сообщениями для разных BackgroundServices и других Сервисов. Ну так и обменвайся информацией. 
+Еслихочешь создатьвнутри своего Серсиас
+
+
+### ASSISTANT
+Вы абсолютно правы! Извините за усложнение. Давайте посмотрим на вашу задачу проще:
+
+**EventHub** - это ваша абстракция для обмена сообщениями между разными компонентами (BackgroundServices, другими сервисами). Всё! Никакого наследования от EventHub не нужно.
+
+**Простой пример использования:**
+
+```csharp
+// Ваш BackgroundService, который публикует события
+public class TradingService : BackgroundService
+{
+    private readonly IEventHub _eventHub;
+    private readonly ILogger<TradingService> _logger;
+
+    public TradingService(IEventHub eventHub, ILogger<TradingService> logger)
+    {
+        _eventHub = eventHub;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            // Ваша логика торговли
+            await ProcessTradingLogic(stoppingToken);
+            
+            // Публикуем событие через EventHub
+            var tradeEvent = new TradeExecutedEvent(/*...*/);
+            await _eventHub.PublishAsync(tradeEvent, stoppingToken);
+            
+            await Task.Delay(1000, stoppingToken); // или какая-то логика задержки
+        }
+    }
+}
+
+// Другой BackgroundService, который подписывается на события
+public class MonitoringService : BackgroundService
+{
+    private readonly IEventHub _eventHub;
+    private readonly IDynamicSubscriptionManager _subscriptionManager;
+    private readonly ILogger<MonitoringService> _logger;
+    private IDisposable _subscription;
+
+    public MonitoringService(
+        IEventHub eventHub, 
+        IDynamicSubscriptionManager subscriptionManager,
+        ILogger<MonitoringService> logger)
+    {
+        _eventHub = eventHub;
+        _subscriptionManager = subscriptionManager;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Подписываемся на события
+        _subscription = _subscriptionManager.Subscribe<TradeExecutedEvent>(
+            Keys.A.Ping, // или ваш ключ для событий торговли
+            async (tradeEvent, ct) =>
+            {
+                _logger.LogInformation("Получено событие торговли: {Ticker}", tradeEvent.Ticker);
+                // Обработка события
+                await ProcessTradeEvent(tradeEvent, ct);
+            });
+
+        await Task.Delay(Timeout.Infinite, stoppingToken);
+    }
+
+    public override void Dispose()
+    {
+        _subscription?.Dispose();
+        base.Dispose();
+    }
+}
+```
+
+**Регистрация в DI:**
+
+```csharp
+// В Program.cs или Startup.cs
+builder.Services.AddEventHub(options =>
+{
+    options.ChannelCapacity = 8192;
+    options.Assemblies = new[] { typeof(Program).Assembly }; // или нужные вам сборки
+});
+```
+
+Всё! Каждый сервис работает со своим функционалом, а EventHub просто передает сообщения между ними. Никакого наследования, никакой сложной вложенности - просто публикация и подписка на события.
+
+### USER
+Давайте напишите пример с использование моего класса EventHub в проекте RazorPage .NetCore 10
+Вверху архитектуры мой  EventHub.
+И еще есть два BackgroundСервиса, которые пишут друг другу сообщения и высвечивают их в Консоли.
+Для простоты будем обмениваться ссобщениями статическими. 
+
+### ASSISTANT
+Вот пример проекта Razor Pages с использованием вашего EventHub и двумя BackgroundService, обменивающимися сообщениями:
+
+**1. Program.cs:**
+
+```csharp
+using BusLibrary02.Core;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Добавляем Razor Pages
+builder.Services.AddRazorPages();
+
+// Регистрируем EventHub
+builder.Services.AddEventHub(options =>
+{
+    options.ChannelCapacity = 8192;
+    options.Assemblies = new[] { typeof(Program).Assembly };
+});
+
+// Регистрируем Background Services
+builder.Services.AddHostedService<FirstBackgroundService>();
+builder.Services.AddHostedService<SecondBackgroundService>();
+
+var app = builder.Build();
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler("/Error");
+    app.UseHsts();
+}
+
+app.UseHttpsRedirection();
+app.UseStaticFiles();
+app.UseRouting();
+app.MapRazorPages();
+
+app.Run();
+```
+
+**2. Сообщения (в той же сборке или отдельной):**
+
+```csharp
+using BusLibrary02.Core;
+
+// Сообщение от первого сервиса ко второму
+public record FirstToSecondMessage(
+    string Text,
+    DateTimeOffset Timestamp = default,
+    string? SenderKey = null) : MessageBase("FirstToSecond", SenderKey);
+
+// Сообщение от второго сервиса к первому  
+public record SecondToFirstMessage(
+    string Text,
+    DateTimeOffset Timestamp = default,
+    string? SenderKey = null) : MessageBase("SecondToFirst", SenderKey);
+
+// Статические ключи
+public static class MessageKeys
+{
+    public const string FirstToSecond = "FirstToSecond";
+    public const string SecondToFirst = "SecondToFirst";
+}
+```
+
+**3. Первый Background Service:**
+
+```csharp
+using BusLibrary02.Core;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+public class FirstBackgroundService : BackgroundService
+{
+    private readonly IEventHub _eventHub;
+    private readonly IDynamicSubscriptionManager _subscriptionManager;
+    private readonly ILogger<FirstBackgroundService> _logger;
+    private IDisposable? _subscription;
+
+    public FirstBackgroundService(
+        IEventHub eventHub,
+        IDynamicSubscriptionManager subscriptionManager,
+        ILogger<FirstBackgroundService> logger)
+    {
+        _eventHub = eventHub;
+        _subscriptionManager = subscriptionManager;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Подписываемся на сообщения от второго сервиса
+        _subscription = _subscriptionManager.Subscribe<SecondToFirstMessage>(
+            MessageKeys.SecondToFirst,
+            async (message, ct) =>
+            {
+                Console.WriteLine($"[FirstService] Получено сообщение: {message.Text}");
+                _logger.LogInformation("[FirstService] Получено: {Text}", message.Text);
+                
+                // Отвечаем второму сервису
+                var response = new FirstToSecondMessage($"Ответ от FirstService: {DateTimeOffset.Now}");
+                await _eventHub.PublishAsync(response, ct);
+            });
+
+        Console.WriteLine("[FirstService] Запущен, начинаю отправку сообщений...");
+
+        var counter = 0;
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var message = new FirstToSecondMessage($"Сообщение от FirstService #{++counter}");
+            
+            Console.WriteLine($"[FirstService] Отправляю: {message.Text}");
+            _logger.LogInformation("[FirstService] Отправляю: {Text}", message.Text);
+            
+            await _eventHub.PublishAsync(message, stoppingToken);
+            
+            await Task.Delay(5000, stoppingToken); // каждые 5 секунд
+        }
+    }
+
+    public override void Dispose()
+    {
+        _subscription?.Dispose();
+        base.Dispose();
+    }
+}
+```
+
+**4. Второй Background Service:**
+
+```csharp
+using BusLibrary02.Core;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+public class SecondBackgroundService : BackgroundService
+{
+    private readonly IEventHub _eventHub;
+    private readonly IDynamicSubscriptionManager _subscriptionManager;
+    private readonly ILogger<SecondBackgroundService> _logger;
+    private IDisposable? _subscription;
+
+    public SecondBackgroundService(
+        IEventHub eventHub,
+        IDynamicSubscriptionManager subscriptionManager,
+        ILogger<SecondBackgroundService> logger)
+    {
+        _eventHub = eventHub;
+        _subscriptionManager = subscriptionManager;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Подписываемся на сообщения от первого сервиса
+        _subscription = _subscriptionManager.Subscribe<FirstToSecondMessage>(
+            MessageKeys.FirstToSecond,
+            async (message, ct) =>
+            {
+                Console.WriteLine($"[SecondService] Получено сообщение: {message.Text}");
+                _logger.LogInformation("[SecondService] Получено: {Text}", message.Text);
+                
+                // Отвечаем первому сервису
+                var response = new SecondToFirstMessage($"Ответ от SecondService: {DateTimeOffset.Now}");
+                await _eventHub.PublishAsync(response, ct);
+            });
+
+        Console.WriteLine("[SecondService] Запущен, готов к приему сообщений...");
+
+        // Второй сервис только отвечает, не отправляет первым
+        await Task.Delay(Timeout.Infinite, stoppingToken);
+    }
+
+    public override void Dispose()
+    {
+        _subscription?.Dispose();
+        base.Dispose();
+    }
+}
+```
+
+**5. Дополнительные файлы Razor Pages можно оставить по умолчанию.**
+
+**Как это работает:**
+- `FirstBackgroundService` каждые 5 секунд отправляет сообщение `FirstToSecondMessage`
+- `SecondBackgroundService` получает это сообщение и отвечает `SecondToFirstMessage`
+- `FirstBackgroundService` получает ответ и снова отвечает
+- Все сообщения выводятся в консоль и логируются
+
+**В консоли будет примерно так:**
+```
+[FirstService] Запущен, начинаю отправку сообщений...
+[SecondService] Запущен, готов к приему сообщений...
+[FirstService] Отправляю: Сообщение от FirstService #1
+[SecondService] Получено: Сообщение от FirstService #1
+[SecondService] Отправляю: Ответ от SecondService: 28.12.2025 10:30:00
+[FirstService] Получено: Ответ от SecondService: 28.12.2025 10:30:00
+[FirstService] Отправляю: Ответ от FirstService: 28.12.2025 10:30:00
+```
+
+EventHub выступает как центральный брокер сообщений между сервисами, обеспечивая слабую связанность и асинхронное взаимодействие.
+
+### USER
+Как вот эту строку завернуть в exceptions, чтобы на ctrlC  не попадатьсяв exception
+await Task.Delay(Timeout.Infinite, stoppingToken);
+?
+
+### ASSISTANT
+Вот как можно обернуть `Task.Delay` в `try-catch`, чтобы корректно обрабатывать `OperationCanceledException` при остановке приложения через Ctrl+C:
+
+**Для второго BackgroundService:**
+
+```csharp
+protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+{
+    // Подписываемся на сообщения от первого сервиса
+    _subscription = _subscriptionManager.Subscribe<FirstToSecondMessage>(
+        MessageKeys.FirstToSecond,
+        async (message, ct) =>
+        {
+            Console.WriteLine($"[SecondService] Получено сообщение: {message.Text}");
+            _logger.LogInformation("[SecondService] Получено: {Text}", message.Text);
+            
+            // Отвечаем первому сервису
+            var response = new SecondToFirstMessage($"Ответ от SecondService: {DateTimeOffset.Now}");
+            await _eventHub.PublishAsync(response, ct);
+        });
+
+    Console.WriteLine("[SecondService] Запущен, готов к приему сообщений...");
+
+    try
+    {
+        // Ожидаем бесконечно, но с обработкой токена отмены
+        await Task.Delay(Timeout.Infinite, stoppingToken);
+    }
+    catch (OperationCanceledException)
+    {
+        // Это нормальное завершение при остановке приложения
+        _logger.LogInformation("[SecondService] Получен токен отмены, завершение работы...");
+        Console.WriteLine("[SecondService] Получен токен отмены, завершение работы...");
+    }
+}
+```
+
+**Или более общий вариант с обработкой всех исключений:**
+
+```csharp
+protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+{
+    // Подписываемся на сообщения от первого сервиса
+    _subscription = _subscriptionManager.Subscribe<FirstToSecondMessage>(
+        MessageKeys.FirstToSecond,
+        async (message, ct) =>
+        {
+            Console.WriteLine($"[SecondService] Получено сообщение: {message.Text}");
+            _logger.LogInformation("[SecondService] Получено: {Text}", message.Text);
+            
+            // Отвечаем первому сервису
+            var response = new SecondToFirstMessage($"Ответ от SecondService: {DateTimeOffset.Now}");
+            await _eventHub.PublishAsync(response, ct);
+        });
+
+    Console.WriteLine("[SecondService] Запущен, готов к приему сообщений...");
+
+    try
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await Task.Delay(1000, stoppingToken); // проверяем токен каждую секунду
+        }
+    }
+    catch (OperationCanceledException)
+    {
+        // Это нормальное завершение при остановке приложения
+        _logger.LogInformation("[SecondService] Получен токен отмены, завершение работы...");
+        Console.WriteLine("[SecondService] Получен токен отмены, завершение работы...");
+    }
+}
+```
+
+**Для первого сервиса тоже можно добавить обработку:**
+
+```csharp
+protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+{
+    // Подписываемся на сообщения от второго сервиса
+    _subscription = _subscriptionManager.Subscribe<SecondToFirstMessage>(
+        MessageKeys.SecondToFirst,
+        async (message, ct) =>
+        {
+            Console.WriteLine($"[FirstService] Получено сообщение: {message.Text}");
+            _logger.LogInformation("[FirstService] Получено: {Text}", message.Text);
+            
+            // Отвечаем второму сервису
+            var response = new FirstToSecondMessage($"Ответ от FirstService: {DateTimeOffset.Now}");
+            await _eventHub.PublishAsync(response, ct);
+        });
+
+    Console.WriteLine("[FirstService] Запущен, начинаю отправку сообщений...");
+
+    var counter = 0;
+    try
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var message = new FirstToSecondMessage($"Сообщение от FirstService #{++counter}");
+            
+            Console.WriteLine($"[FirstService] Отправляю: {message.Text}");
+            _logger.LogInformation("[FirstService] Отправляю: {Text}", message.Text);
+            
+            await _eventHub.PublishAsync(message, stoppingToken);
+            
+            await Task.Delay(5000, stoppingToken);
+        }
+    }
+    catch (OperationCanceledException)
+    {
+        _logger.LogInformation("[FirstService] Получен токен отмены, завершение работы...");
+        Console.WriteLine("[FirstService] Получен токен отмены, завершение работы...");
+    }
+}
+```
+
+Теперь при остановке приложения через Ctrl+C не будет исключений в консоли - будет корректная обработка отмены.
+
+### USER
+Шикарно
+Спасибо все работает.
+Неужели это мой EventHub так работает.
+Или это Вы собственный механизм применили.
+?
+
+### ASSISTANT
+Все работает благодаря **вашему EventHub**! 🎉
+
+Вы создали полноценную систему обмена сообщениями, и я просто использовал её по назначению:
+
+- **IEventHub** - для публикации сообщений
+- **IDynamicSubscriptionManager** - для динамических подписок
+- **Сообщения на основе IMessage** - для передачи данных
+- **Каналы и асинхронная обработка** - внутри вашего EventHub
+
+Ваша реализация:
+- Обеспечивает слабую связанность между сервисами
+- Позволяет динамически подписываться/отписываться от событий
+- Обрабатывает сообщения асинхронно без блокировок
+- Корректно работает с CancellationToken
+
+Я только использовал готовые интерфейсы и классы из вашей библиотеки - всё "магия" внутри **вашего EventHub**!
+
+### USER
+Тогда расскажите мне еще одну вещь в контексте EventHub
+Есть статические events,аестьдинамическиевчем разница, когда применяем статические, когда динамические ?
+// Базовые события торговой платформы
+[MessageKey("quote:generated")]
+public record QuoteGeneratedEvent(
+    string Symbol,
+    decimal Open,
+    decimal High,
+    decimal Low,
+    decimal Close,
+    long Volume,
+    DateTime Timestamp
+) : MessageBase("quote:generated");
+
+[MessageKey("strategy:tick")]
+public record StrategyTickEvent(
+    string Symbol,
+    decimal Price,
+    long Volume,
+    DateTime Timestamp,
+    long TickId
+) : MessageBase($"strategy:tick:{Symbol}");
+
+[MessageKey("strategy:signal")]
+public record StrategySignalEvent(
+    string Symbol,
+    string StrategyName,
+    string Signal,
+    decimal Price,
+    int Quantity,
+    DateTime Timestamp
+) : MessageBase($"strategy:signal:{Symbol}:{StrategyName}");
+
+[MessageKey("trade:executed")]
+public record TradeExecutedEvent(
+    string Symbol,
+    string Side,
+    decimal Price,
+    int Quantity,
+    string StrategyName,
+    DateTime Timestamp
+) : MessageBase($"trade:{Symbol}");
+
+[MessageKey("position:changed")]
+public record PositionChangedEvent(
+    string Symbol,
+    int NetQuantity,
+    decimal UnrealizedPnL,
+    string Status,
+    DateTime Timestamp
+) : MessageBase($"position:{Symbol}");
+
+[MessageKey("order:created")]
+public record OrderCreatedEvent(
+    string Symbol,
+    string Side,
+    decimal Price,
+    int Quantity,
+    string Status,
+    string OrderNumber,
+    DateTime Timestamp
+) : MessageBase($"order:{Symbol}");
+
+[MessageKey("deal:closed")]
+public record DealClosedEvent(
+    string Symbol,
+    long DealNumber,
+    string Side,
+    int Qty,
+    decimal OpenPrice,
+    decimal ClosePrice,
+    decimal PnL,
+    DateTime Timestamp
+) : MessageBase($"deal:{Symbol}");
+
+[MessageKey("chart:update")]
+public record ChartUpdateEvent(
+    string Symbol,
+    DateTime Timestamp
+) : MessageBase($"chart:update:{Symbol}");
+
+[MessageKey("system:status")]
+public record SystemStatusEvent(
+    string Component,
+    string Status,
+    string Message,
+    DateTime Timestamp
+) : MessageBase($"system:{Component}"); 
+?
+
+### ASSISTANT
+**Статические и динамические подписки** в вашем EventHub - это два разных подхода к обработке событий:
+
+### **Статические подписки:**
+- Используют атрибут `[Handles("ключ")]`
+- Регистрируются при старте приложения
+- Компилятор знает о них заранее
+- Подходят для **постоянных обработчиков**
+
+**Пример:**
+```csharp
+[Handles("trade:executed")]  // Статическая подписка
+public class TradeProcessor : IMessageHandler<TradeExecutedEvent>
+{
+    public ValueTask Handle(TradeExecutedEvent message, CancellationToken ct)
+    {
+        // Обрабатывает все события TradeExecutedEvent
+    }
+}
+```
+
+### **Динамические подписки:**
+- Через `IDynamicSubscriptionManager.Subscribe()`
+- Можно подписываться/отписываться в runtime
+- Подходят для **временных обработчиков**
+
+**Пример:**
+```csharp
+// Подписываемся в runtime
+subscription = subscriptionManager.Subscribe<TradeExecutedEvent>(
+    "trade:executed",
+    async (message, ct) => { /* обработка */ });
+```
+
+### **Когда что использовать:**
+
+**Статические** - для основных компонентов:
+- Логирование всех сделок
+- Обновление позиций
+- Аудит системы
+
+**Динамические** - для ситуативных задач:
+- Временный мониторинг
+- Тестирование
+- Интерактивные компоненты
+- Подписки по критериям
+
+### **В вашем примере:**
+
+**Статические ключи** (MessageKey) - это **не подписки**, а **ключи сообщений**:
+```csharp
+[MessageKey("quote:generated")]  // Это ключ сообщения
+public record QuoteGeneratedEvent(...) : MessageBase("quote:generated");
+```
+
+Это позволяет использовать **динамические подписки** по типу сообщения:
+```csharp
+subscriptionManager.Subscribe<QuoteGeneratedEvent>(
+    async (msg, ct) => { /* обработка котировок */ });
+```
+
+**Резюме:**
+- `[Handles]` → статические подписки (на старте)
+- `Subscribe()` → динамические подписки (в runtime)
+- `[MessageKey]` → ключи сообщений (для удобства динамических подписок)
+
+В вашей системе можно использовать оба подхода одновременно!
+
+### USER
+Посмотрите внимательно они все разные
+Как то есть например для всех котировок  events,
+а можно добавить к этому ещенаименование "MSFT",то будет передача только "MSFT"
+Это Динамическая и статическая форма (чего не знаю events, subscribe итд)
+
+### ASSISTANT
+Теперь я вижу! Вы говорите о **динамических ключах** на основе **статических событий**. Давайте разберем:
+
+### **Ваши сообщения - это статические события:**
+
+```csharp
+[MessageKey("quote:generated")]  // Это статический ключ для всех котировок
+public record QuoteGeneratedEvent(
+    string Symbol,  // Но внутри есть динамическое поле - символ
+    decimal Open,
+    // ...
+) : MessageBase("quote:generated");  // Это всегда "quote:generated"
+```
+
+### **Проблема:**
+- Все события `QuoteGeneratedEvent` имеют одинаковый ключ `"quote:generated"`
+- Невозможно подписаться на котировки только для `"MSFT"`
+
+### **Решение - динамические ключи:**
+
+```csharp
+// Статическое событие с динамическим ключом
+public record QuoteGeneratedEvent(
+    string Symbol,  // Это динамическое значение
+    decimal Open,
+    decimal High,
+    decimal Low,
+    decimal Close,
+    long Volume,
+    DateTime Timestamp
+) : MessageBase($"quote:{Symbol}");  // Ключ зависит от символа!
+
+// Теперь можно подписаться на конкретный символ:
+// - "quote:MSFT" - только для Microsoft
+// - "quote:AAPL" - только для Apple
+// - "quote:*" - для всех котировок
+```
+
+### **Пример использования:**
+
+```csharp
+// Подписка на все котировки:
+subscriptionManager.Subscribe<QuoteGeneratedEvent>(
+    "quote:*",  // или просто используем тип
+    async (msg, ct) => { /* все котировки */ });
+
+// Подписка на MSFT:
+subscriptionManager.Subscribe<QuoteGeneratedEvent>(
+    "quote:MSFT",  // только MSFT
+    async (msg, ct) => { /* только MSFT */ });
+```
+
+### **В вашем коде:**
+```csharp
+// Уже правильно - динамические ключи:
+MessageBase($"strategy:tick:{Symbol}");        // разные ключи для разных символов
+MessageBase($"strategy:signal:{Symbol}:{StrategyName}");  // разные ключи для разных стратегий
+MessageBase($"trade:{Symbol}");               // разные ключи для разных символов
+```
+
+**Вывод:**
+- **Статические события** - это классы сообщений
+- **Динамические ключи** - это ключи, формируемые на основе данных в сообщении
+- Вы уже используете **гибрид** - статические классы с динамическими ключами!
+
+### USER
+Запутаться можно.
+Можете мне все это объснить с подробнои с точными формулировкамит категорий.
+А то очень много динамического - и ключи и подписки и рекорды
+А еще есть статические и динамические поиски handlers 
+Запутаться можно.
+
+### ASSISTANT
+**Полная классификация понятий в вашем EventHub:**
+
+---
+
+### **1. КЛАССЫ СООБЩЕНИЙ (Message Classes)**
+
+#### **Статические определения:**
+- **Что:** Классы `record` с фиксированной структурой
+- **Пример:**
+```csharp
+public record QuoteGeneratedEvent(string Symbol, decimal Price, DateTime Timestamp);
+```
+- **Характеристика:** Определены на этапе компиляции
+
+#### **Динамические экземпляры:**
+- **Что:** Объекты этих классов с разными данными
+- **Пример:**
+```csharp
+var msftQuote = new QuoteGeneratedEvent("MSFT", 300m, DateTime.Now);
+var aaplQuote = new QuoteGeneratedEvent("AAPL", 200m, DateTime.Now);
+```
+- **Характеристика:** Создаются в runtime с разными значениями
+
+---
+
+### **2. КЛЮЧИ СООБЩЕНИЙ (Message Keys)**
+
+#### **Статические ключи:**
+- **Что:** Фиксированные строки, определенные в коде
+- **Пример:**
+```csharp
+MessageBase("quote:generated")  // всегда "quote:generated"
+```
+- **Характеристика:** Одинаковые для всех экземпляров сообщения
+
+#### **Динамические ключи:**
+- **Что:** Ключи, формируемые на основе данных в сообщении
+- **Пример:**
+```csharp
+MessageBase($"quote:{Symbol}")  // "quote:MSFT", "quote:AAPL", ...
+```
+- **Характеристика:** Разные для разных экземпляров
+
+---
+
+### **3. ПОДПИСКИ (Subscriptions)**
+
+#### **Статические подписки:**
+- **Что:** Обработчики, зарегистрированные через атрибуты `[Handles("ключ")]`
+- **Когда регистрируются:** При старте приложения
+- **Пример:**
+```csharp
+[Handles("quote:generated")]  // Подписка на фиксированный ключ
+public class AllQuotesHandler : IMessageHandler<QuoteGeneratedEvent>
+```
+- **Характеристика:** Известны на этапе компиляции
+
+#### **Динамические подписки:**
+- **Что:** Подписки, создаваемые в runtime через `Subscribe()`
+- **Когда регистрируются:** Во время выполнения
+- **Пример:**
+```csharp
+subscriptionManager.Subscribe<QuoteGeneratedEvent>(
+    "quote:MSFT",  // runtime-ключ
+    async (msg, ct) => { /* обработка */ });
+```
+- **Характеристика:** Могут меняться в runtime
+
+---
+
+### **4. ОБРАБОТЧИКИ (Handlers)**
+
+#### **Статический поиск обработчиков:**
+- **Что:** Поиск через атрибуты `[Handles]` при старте
+- **Где используется:** `EventHandlerRegistry`, `AttributeKeyRouter`
+- **Характеристика:** Компилятор знает о них заранее
+
+#### **Динамический поиск обработчиков:**
+- **Что:** Поиск через `DynamicSubscriptionManager` в runtime
+- **Где используется:** `CompositeKeyRouter`
+- **Характеристика:** Подписки могут добавляться/удаляться
+
+---
+
+### **5. РЕЗЮМЕ КАТЕГОРИЙ:**
+
+| Категория | Статическое | Динамическое |
+|-----------|-------------|--------------|
+| **Сообщения** | Классы record | Экземпляры с разными данными |
+| **Ключи** | Фиксированные строки | Формируются из данных сообщения |
+| **Подписки** | `[Handles("ключ")]` | `Subscribe("ключ", handler)` |
+| **Обработчики** | Регистрация при старте | Поиск в runtime |
+
+---
+
+**Пример связки:**
+```csharp
+// 1. Статическое определение
+public record QuoteEvent(string Symbol, decimal Price) 
+    : MessageBase($"quote:{Symbol}");  // динамический ключ
+
+// 2. Статическая подписка (на все котировки)
+[Handles("quote:generated")]  
+class AllQuotesHandler { }
+
+// 3. Динамическая подписка (на конкретный символ)
+Subscribe<QuoteEvent>("quote:MSFT", handler);
+```
+
+Теперь понятно?
+
+### USER
+Вот у меня пример
+using BusLibrary02.Core;
+
+namespace TradingPlatform.Events;
+
+// Базовые события торговой платформы
+[MessageKey("quote:generated")]
+public record QuoteGeneratedEvent(
+    string Symbol,
+    decimal Open,
+    decimal High,
+    decimal Low,
+    decimal Close,
+    long Volume,
+    DateTime Timestamp
+) : MessageBase("quote:generated");
+
+[MessageKey("strategy:tick")]
+public record StrategyTickEvent(
+    string Symbol,
+    decimal Price,
+    long Volume,
+    DateTime Timestamp,
+    long TickId
+) : MessageBase($"strategy:tick:{Symbol}");
+
+[MessageKey("strategy:signal")]
+public record StrategySignalEvent(
+    string Symbol,
+    string StrategyName,
+    string Signal,
+    decimal Price,
+    int Quantity,
+    DateTime Timestamp
+) : MessageBase($"strategy:signal:{Symbol}:{StrategyName}");
+
+[MessageKey("trade:executed")]
+public record TradeExecutedEvent(
+    string Symbol,
+    string Side,
+    decimal Price,
+    int Quantity,
+    string StrategyName,
+    DateTime Timestamp
+) : MessageBase($"trade:{Symbol}");
+
+[MessageKey("position:changed")]
+public record PositionChangedEvent(
+    string Symbol,
+    int NetQuantity,
+    decimal UnrealizedPnL,
+    string Status,
+    DateTime Timestamp
+) : MessageBase($"position:{Symbol}");
+
+[MessageKey("order:created")]
+public record OrderCreatedEvent(
+    string Symbol,
+    string Side,
+    decimal Price,
+    int Quantity,
+    string Status,
+    string OrderNumber,
+    DateTime Timestamp
+) : MessageBase($"order:{Symbol}");
+
+[MessageKey("deal:closed")]
+public record DealClosedEvent(
+    string Symbol,
+    long DealNumber,
+    string Side,
+    int Qty,
+    decimal OpenPrice,
+    decimal ClosePrice,
+    decimal PnL,
+    DateTime Timestamp
+) : MessageBase($"deal:{Symbol}");
+
+[MessageKey("chart:update")]
+public record ChartUpdateEvent(
+    string Symbol,
+    DateTime Timestamp
+) : MessageBase($"chart:update:{Symbol}");
+
+[MessageKey("system:status")]
+public record SystemStatusEvent(
+    string Component,
+    string Status,
+    string Message,
+    DateTime Timestamp
+) : MessageBase($"system:{Component}");
+---
+Напишите для каждого экземпляра подробно - что это - статика, динамика, какая сущность, поведениеитд
+
+### ASSISTANT
+**Анализ каждого сообщения в вашем примере:**
+
+---
+
+### **1. `QuoteGeneratedEvent`**
+
+```csharp
+[MessageKey("quote:generated")]
+public record QuoteGeneratedEvent(
+    string Symbol,
+    decimal Open,
+    decimal High,
+    decimal Low,
+    decimal Close,
+    long Volume,
+    DateTime Timestamp
+) : MessageBase("quote:generated");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс, определен на этапе компиляции
+- **Статический ключ:** `"quote:generated"` (фиксированный)
+- **Динамические данные:** `Symbol`, `Open`, `High`, `Low`, `Close`, `Volume`, `Timestamp`
+- **Тип ключа:** **Статический** (все экземпляры имеют одинаковый ключ)
+- **Назначение:** Событие о генерации котировок (все символы)
+- **Поведение:** Подписка по фиксированному ключу - получает все котировки
+
+---
+
+### **2. `StrategyTickEvent`**
+
+```csharp
+[MessageKey("strategy:tick")]
+public record StrategyTickEvent(
+    string Symbol,
+    decimal Price,
+    long Volume,
+    DateTime Timestamp,
+    long TickId
+) : MessageBase($"strategy:tick:{Symbol}");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс
+- **Статический атрибут:** `[MessageKey("strategy:tick")]`
+- **Динамический ключ:** `"strategy:tick:{Symbol}"` (разный для разных символов)
+- **Динамические данные:** `Symbol`, `Price`, `Volume`, `Timestamp`, `TickId`
+- **Тип ключа:** **Динамический** (ключ зависит от символа)
+- **Назначение:** Событие тика стратегии для конкретного символа
+- **Поведение:** Подписка по символу - `strategy:tick:MSFT`, `strategy:tick:AAPL`
+
+---
+
+### **3. `StrategySignalEvent`**
+
+```csharp
+[MessageKey("strategy:signal")]
+public record StrategySignalEvent(
+    string Symbol,
+    string StrategyName,
+    string Signal,
+    decimal Price,
+    int Quantity,
+    DateTime Timestamp
+) : MessageBase($"strategy:signal:{Symbol}:{StrategyName}");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс
+- **Статический атрибут:** `[MessageKey("strategy:signal")]`
+- **Динамический ключ:** `"strategy:signal:{Symbol}:{StrategyName}"` (уникальный для каждой пары символ/стратегия)
+- **Динамические данные:** `Symbol`, `StrategyName`, `Signal`, `Price`, `Quantity`, `Timestamp`
+- **Тип ключа:** **Динамический** (ключ зависит от символа и имени стратегии)
+- **Назначение:** Сигнал от конкретной стратегии для конкретного символа
+- **Поведение:** Подписка по символу и стратегии - `strategy:signal:MSFT:MovingAverage`
+
+---
+
+### **4. `TradeExecutedEvent`**
+
+```csharp
+[MessageKey("trade:executed")]
+public record TradeExecutedEvent(
+    string Symbol,
+    string Side,
+    decimal Price,
+    int Quantity,
+    string StrategyName,
+    DateTime Timestamp
+) : MessageBase($"trade:{Symbol}");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс
+- **Статический атрибут:** `[MessageKey("trade:executed")]`
+- **Динамический ключ:** `"trade:{Symbol}"` (разный для разных символов)
+- **Динамические данные:** `Symbol`, `Side`, `Price`, `Quantity`, `StrategyName`, `Timestamp`
+- **Тип ключа:** **Динамический** (ключ зависит от символа)
+- **Назначение:** Событие исполненной сделки для конкретного символа
+- **Поведение:** Подписка по символу - `trade:MSFT`, `trade:AAPL`
+
+---
+
+### **5. `PositionChangedEvent`**
+
+```csharp
+[MessageKey("position:changed")]
+public record PositionChangedEvent(
+    string Symbol,
+    int NetQuantity,
+    decimal UnrealizedPnL,
+    string Status,
+    DateTime Timestamp
+) : MessageBase($"position:{Symbol}");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс
+- **Статический атрибут:** `[MessageKey("position:changed")]`
+- **Динамический ключ:** `"position:{Symbol}"` (разный для разных символов)
+- **Динамические данные:** `Symbol`, `NetQuantity`, `UnrealizedPnL`, `Status`, `Timestamp`
+- **Тип ключа:** **Динамический** (ключ зависит от символа)
+- **Назначение:** Изменение позиции для конкретного символа
+- **Поведение:** Подписка по символу - `position:MSFT`, `position:AAPL`
+
+---
+
+### **6. `OrderCreatedEvent`**
+
+```csharp
+[MessageKey("order:created")]
+public record OrderCreatedEvent(
+    string Symbol,
+    string Side,
+    decimal Price,
+    int Quantity,
+    string Status,
+    string OrderNumber,
+    DateTime Timestamp
+) : MessageBase($"order:{Symbol}");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс
+- **Статический атрибут:** `[MessageKey("order:created")]`
+- **Динамический ключ:** `"order:{Symbol}"` (разный для разных символов)
+- **Динамические данные:** `Symbol`, `Side`, `Price`, `Quantity`, `Status`, `OrderNumber`, `Timestamp`
+- **Тип ключа:** **Динамический** (ключ зависит от символа)
+- **Назначение:** Создание ордера для конкретного символа
+- **Поведение:** Подписка по символу - `order:MSFT`, `order:AAPL`
+
+---
+
+### **7. `DealClosedEvent`**
+
+```csharp
+[MessageKey("deal:closed")]
+public record DealClosedEvent(
+    string Symbol,
+    long DealNumber,
+    string Side,
+    int Qty,
+    decimal OpenPrice,
+    decimal ClosePrice,
+    decimal PnL,
+    DateTime Timestamp
+) : MessageBase($"deal:{Symbol}");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс
+- **Статический атрибут:** `[MessageKey("deal:closed")]`
+- **Динамический ключ:** `"deal:{Symbol}"` (разный для разных символов)
+- **Динамические данные:** `Symbol`, `DealNumber`, `Side`, `Qty`, `OpenPrice`, `ClosePrice`, `PnL`, `Timestamp`
+- **Тип ключа:** **Динамический** (ключ зависит от символа)
+- **Назначение:** Закрытие сделки для конкретного символа
+- **Поведение:** Подписка по символу - `deal:MSFT`, `deal:AAPL`
+
+---
+
+### **8. `ChartUpdateEvent`**
+
+```csharp
+[MessageKey("chart:update")]
+public record ChartUpdateEvent(
+    string Symbol,
+    DateTime Timestamp
+) : MessageBase($"chart:update:{Symbol}");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс
+- **Статический атрибут:** `[MessageKey("chart:update")]`
+- **Динамический ключ:** `"chart:update:{Symbol}"` (разный для разных символов)
+- **Динамические данные:** `Symbol`, `Timestamp`
+- **Тип ключа:** **Динамический** (ключ зависит от символа)
+- **Назначение:** Обновление графика для конкретного символа
+- **Поведение:** Подписка по символу - `chart:update:MSFT`, `chart:update:AAPL`
+
+---
+
+### **9. `SystemStatusEvent`**
+
+```csharp
+[MessageKey("system:status")]
+public record SystemStatusEvent(
+    string Component,
+    string Status,
+    string Message,
+    DateTime Timestamp
+) : MessageBase($"system:{Component}");
+```
+
+**Классификация:**
+- **Статическое определение:** `record` класс
+- **Статический атрибут:** `[MessageKey("system:status")]`
+- **Динамический ключ:** `"system:{Component}"` (разный для разных компонентов)
+- **Динамические данные:** `Component`, `Status`, `Message`, `Timestamp`
+- **Тип ключа:** **Динамический** (ключ зависит от компонента)
+- **Назначение:** Статус системы для конкретного компонента
+- **Поведение:** Подписка по компоненту - `system:TradingEngine`, `system:RiskManager`
+
+---
+
+### **Сводная таблица:**
+
+| Событие | Атрибут | Ключ | Тип ключа | Назначение |
+|---------|---------|------|------------|------------|
+| `QuoteGeneratedEvent` | `"quote:generated"` | `"quote:generated"` | **Статический** | Все котировки |
+| `StrategyTickEvent` | `"strategy:tick"` | `"strategy:tick:{Symbol}"` | **Динамический** | Тик стратегии по символу |
+| `StrategySignalEvent` | `"strategy:signal"` | `"strategy:signal:{Symbol}:{StrategyName}"` | **Динамический** | Сигнал стратегии |
+| `TradeExecutedEvent` | `"trade:executed"` | `"trade:{Symbol}"` | **Динамический** | Сделка по символу |
+| `PositionChangedEvent` | `"position:changed"` | `"position:{Symbol}"` | **Динамический** | Позиция по символу |
+| `OrderCreatedEvent` | `"order:created"` | `"order:{Symbol}"` | **Динамический** | Ордер по символу |
+| `DealClosedEvent` | `"deal:closed"` | `"deal:{Symbol}"` | **Динамический** | Сделка по символу |
+| `ChartUpdateEvent` | `"chart:update"` | `"chart:update:{Symbol}"` | **Динамический** | График по символу |
+| `SystemStatusEvent` | `"system:status"` | `"system:{Component}"` | **Динамический** | Статус компонента |
+
+**Вывод:** 8 из 9 событий используют **динамические ключи**, только `QuoteGeneratedEvent` - **статический ключ**.
